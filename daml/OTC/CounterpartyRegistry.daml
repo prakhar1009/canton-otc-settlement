@@ -1,0 +1,63 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module OTC.CounterpartyRegistry where
+
+import DA.Set (Set)
+import qualified DA.Set
+import DA.Text (show)
+
+-- | Defines a registry of approved counterparties, managed by a central operator.
+-- This contract serves as a gatekeeper for the OTC trading system, ensuring that
+-- only verified and permissioned parties can participate in trading and settlement.
+template Registry
+  with
+    operator : Party
+      -- ^ The party that manages the registry (e.g., the platform operator or clearing house).
+    counterparties : Set Party
+      -- ^ The set of parties approved to trade on the platform. Using a Set ensures
+      -- uniqueness and provides efficient membership checks.
+  where
+    signatory operator
+    observer DA.Set.toList counterparties
+
+    key operator : Party
+    maintainer key.operator
+
+    -- | Allows the operator to add a new party to the set of approved counterparties.
+    choice AddCounterparty : ContractId Registry
+      with
+        partyToAdd : Party
+          -- ^ The party to be added to the registry.
+      controller operator
+      do
+        assertMsg "Counterparty to add is already in the registry."
+          (not $ DA.Set.member partyToAdd counterparties)
+
+        create this with
+          counterparties = DA.Set.insert partyToAdd counterparties
+
+    -- | Allows the operator to remove a party from the set of approved counterparties.
+    choice RemoveCounterparty : ContractId Registry
+      with
+        partyToRemove : Party
+          -- ^ The party to be removed from the registry.
+      controller operator
+      do
+        assertMsg "Counterparty to remove is not in the registry."
+          (DA.Set.member partyToRemove counterparties)
+
+        create this with
+          counterparties = DA.Set.delete partyToRemove counterparties
+
+    -- | A non-consuming choice that can be used by other contracts to verify that a
+    -- given party is an approved member of the registry. This is crucial for pre-trade
+    -- checks and ensuring that proposals are only sent to valid counterparties.
+    nonconsuming choice AssertIsApproved : ()
+      with
+        partyToCheck : Party
+          -- ^ The party whose membership in the registry needs to be verified.
+      controller (operator :: DA.Set.toList counterparties)
+      do
+        assertMsg (show partyToCheck <> " is not an approved counterparty.")
+          (DA.Set.member partyToCheck counterparties)
