@@ -1,0 +1,32 @@
+# Daml and DPM build artifacts
+.daml/
+.dpm/
+*.dar
+
+# Node.js / TypeScript
+node_modules/
+dist/
+build/
+.npm
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# General build output
+target/
+
+# Environment variables - sensitive, do not commit
+.env
+.env.*
+!.env.example
+
+# IDE and editor directories
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Operating System files
+.DS_Store
+Thumbs.db
