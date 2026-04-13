@@ -1,0 +1,70 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module OTC.TradeConfirmation where
+
+import DA.Date (Date)
+import DA.Time (Time)
+import DA.Text (Text)
+
+-- | Represents a legally binding confirmation of a matched trade between two parties.
+-- This contract is created after the MatchingEngine successfully matches two proposals.
+-- It serves as the immutable "golden record" of the trade's economic terms, visible
+-- to both counterparties.
+template TradeConfirmation
+  with
+    tradeId: Text                 -- ^ A unique identifier for the trade.
+    partyA: Party                 -- ^ The first counterparty in the trade.
+    partyB: Party                 -- ^ The second counterparty in the trade.
+    seller: Party                 -- ^ The party selling the asset.
+    buyer: Party                  -- ^ The party buying the asset.
+    assetSymbol: Text             -- ^ The symbol of the asset being traded (e.g., "AAPL", "BTC").
+    quantity: Decimal             -- ^ The amount of the asset to be exchanged. Must be positive.
+    price: Decimal                -- ^ The price per unit of the asset. Must be positive.
+    settlementAmount: Decimal     -- ^ The total cash amount for settlement (quantity * price).
+    settlementCurrency: Text      -- ^ The currency for settlement (e.g., "USD", "EUR").
+    settlementDate: Date          -- ^ The agreed-upon date for settlement.
+    masterAgreementId: Optional Text -- ^ Optional reference to a master trading agreement (e.g., ISDA).
+    creationTime: Time            -- ^ The timestamp when this confirmation was created.
+  where
+    signatory partyA, partyB
+
+    ensure
+      -- The seller and buyer must be the two parties to the trade.
+      ( (seller == partyA && buyer == partyB) ||
+        (seller == partyB && buyer == partyA)
+      ) &&
+      -- The total settlement amount must equal quantity times price.
+      settlementAmount == quantity * price &&
+      -- Quantity and price must be positive to represent a valid trade.
+      quantity > 0.0 &&
+      price > 0.0
+
+    key (min partyA partyB, max partyA partyB, tradeId) : (Party, Party, Text)
+    maintainer key._1, key._2
+
+    -- | Non-consuming choice to allow either party to view the details of the confirmed trade.
+    -- This is useful for UI or integration layers to fetch trade data without archiving the
+    -- confirmation contract.
+    nonconsuming choice ViewTradeDetails : TradeConfirmation
+      controller partyA, partyB
+      do
+        return self
+
+-- | Helper data type to bundle trade confirmation details for creation.
+-- This can be used by the MatchingEngine to pass all necessary info in one go,
+-- improving code clarity and maintainability.
+data TradeDetails = TradeDetails
+  with
+    tradeId: Text
+    partyA: Party
+    partyB: Party
+    seller: Party
+    buyer: Party
+    assetSymbol: Text
+    quantity: Decimal
+    price: Decimal
+    settlementCurrency: Text
+    settlementDate: Date
+    masterAgreementId: Optional Text
+  deriving (Eq, Show)
