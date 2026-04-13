@@ -1,0 +1,113 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module OTC.DvPSettlement where
+
+import Daml.Finance.Interface.Asset.Instrument qualified as Instrument (Key)
+import Daml.Finance.Interface.Settlement.Allocation qualified as Allocation (I, Settle(..), View(..))
+import DA.Date (Date)
+import DA.Set (elem, singleton)
+
+-- | Represents a matched, bilateral trade agreement ready for settlement.
+-- This contract is created by the `MatchingEngine` once two compatible `Proposal`
+-- contracts have been found and accepted by their respective owners. It serves
+-- as the authoritative record of the trade's terms before settlement.
+template MatchedTrade
+  with
+    tradeId         : Text
+      -- ^ A unique identifier for the trade.
+    operator        : Party
+      -- ^ The party operating the matching engine.
+    buyer           : Party
+      -- ^ The party buying the base instrument.
+    seller          : Party
+      -- ^ The party selling the base instrument.
+    baseInstrument  : Instrument.Key
+      -- ^ The instrument being sold by the seller and bought by the buyer.
+    baseQuantity    : Decimal
+      -- ^ The quantity of the base instrument to be exchanged.
+    quoteInstrument : Instrument.Key
+      -- ^ The instrument being used as payment (e.g., cash).
+    quoteQuantity   : Decimal
+      -- ^ The quantity of the quote instrument to be exchanged.
+    settlementDate  : Date
+      -- ^ The target date for settlement.
+  where
+    signatory operator
+    observer buyer, seller
+
+    key (operator, tradeId) : (Party, Text)
+    maintainer key._1
+
+    -- | Atomically settles the trade using a delivery-versus-payment (DvP) mechanism.
+    -- This choice requires both parties to have pre-allocated the assets they are
+    -- delivering. The buyer provides an allocation of the quote asset, and the
+    -- seller provides an allocation of the base asset.
+    -- The Canton infrastructure guarantees that the two settlement exercises within
+    -- this choice are atomic: either both asset transfers succeed, or the entire
+    -- transaction fails, eliminating settlement risk.
+    choice Settle : ContractId SettledTrade
+      with
+        baseAllocationCid  : ContractId Allocation.I
+          -- ^ A contract ID for the seller's allocated base instrument.
+        quoteAllocationCid : ContractId Allocation.I
+          -- ^ A contract ID for the buyer's allocated quote instrument.
+      controller buyer, seller
+      do
+        -- Fetch the allocation contracts. This requires the controller to be an
+        -- observer on the provided allocation contracts. In the daml-finance
+        -- model, being a 'spender' on an allocation grants observer rights.
+        baseAllocation <- fetch baseAllocationCid
+        quoteAllocation <- fetch quoteAllocationCid
+
+        -- Validate the seller's base asset allocation.
+        assertMsg "Seller must be the owner of the base asset allocation."
+          (baseAllocation.account.owner == seller)
+        assertMsg "Base allocation instrument does not match the trade."
+          (baseAllocation.amount.unit == baseInstrument)
+        assertMsg "Base allocation quantity does not match the trade."
+          (baseAllocation.amount.quantity == baseQuantity)
+        assertMsg "Buyer must be a designated spender on the base asset allocation."
+          (buyer `elem` baseAllocation.spenders)
+
+        -- Validate the buyer's quote asset allocation.
+        assertMsg "Buyer must be the owner of the quote asset allocation."
+          (quoteAllocation.account.owner == buyer)
+        assertMsg "Quote allocation instrument does not match the trade."
+          (quoteAllocation.amount.unit == quoteInstrument)
+        assertMsg "Quote allocation quantity does not match the trade."
+          (quoteAllocation.amount.quantity == quoteQuantity)
+        assertMsg "Seller must be a designated spender on the quote asset allocation."
+          (seller `elem` quoteAllocation.spenders)
+
+        -- Atomically execute the two legs of the settlement.
+        -- The `Allocation.Settle` choice consumes the allocation and produces a
+        -- `Transfer` instruction, which is then processed by the relevant custodian.
+        -- The `settlers` parameter determines who can see the resulting `Transfer`.
+        exercise baseAllocationCid Allocation.Settle with settlers = singleton buyer
+        exercise quoteAllocationCid Allocation.Settle with settlers = singleton seller
+
+        -- Archive the `MatchedTrade` and create a `SettledTrade` to serve as a
+        -- permanent, auditable record of the completed transaction.
+        create SettledTrade with ..
+
+-- | An archival contract representing a trade that has been successfully settled.
+-- This contract is created upon the successful exercise of the `Settle` choice on
+-- a `MatchedTrade` contract. It has no choices and serves as a factual record
+-- for all involved parties.
+template SettledTrade
+  with
+    tradeId         : Text
+    operator        : Party
+    buyer           : Party
+    seller          : Party
+    baseInstrument  : Instrument.Key
+    baseQuantity    : Decimal
+    quoteInstrument : Instrument.Key
+    quoteQuantity   : Decimal
+    settlementDate  : Date
+  where
+    signatory operator, buyer, seller
+
+    key (operator, tradeId) : (Party, Text)
+    maintainer key._1
