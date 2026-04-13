@@ -1,0 +1,195 @@
+module OTC.MatchingEngine where
+
+import Daml.Script
+import DA.Assert ((===))
+import DA.Date (Date, toDateUTC)
+import DA.Time (getTime)
+
+import OTC.Proposal (Proposal(..))
+
+-- | Represents the outcome of a successful match between two proposals.
+-- This is a bilateral agreement, visible to and signed by both buyer and seller,
+-- which forms the basis for settlement.
+template MatchedTrade
+  with
+    tradeId          : Text
+    buyer            : Party
+    seller           : Party
+    instrumentId     : Text
+    quantity         : Decimal
+    price            : Decimal
+    settlementAmount : Decimal
+    tradeDate        : Date
+  where
+    signatory buyer, seller
+
+    key (buyer, seller, tradeId) : (Party, Party, Text)
+    maintainer key._1, key._2
+
+    ensure settlementAmount == quantity * price
+
+-- | A contract to facilitate the private matching of two proposals.
+-- The proposer creates this contract, inviting the counterparty to match their
+-- proposal with one of the counterparty's own.
+-- The terms of the proposer's proposal remain private until the counterparty
+-- attempts to accept the invitation.
+template MatchInvitation
+  with
+    invitationId        : Text
+    proposer            : Party
+    counterparty        : Party
+    proposerProposalCid : ContractId Proposal
+  where
+    signatory proposer
+    observer counterparty
+
+    key (proposer, counterparty, invitationId) : (Party, Party, Text)
+    maintainer key._1
+
+    -- | The counterparty attempts to match their proposal with the proposer's.
+    -- If the proposals are compatible (same instrument, quantity, price, and
+    -- opposite sides), they are atomically archived and a `MatchedTrade`
+    -- contract is created.
+    -- If they are not compatible, the transaction fails, and no state is changed,
+    -- preserving the privacy of both parties' proposals.
+    choice AcceptMatch : ContractId MatchedTrade
+      with
+        counterpartyProposalCid : ContractId Proposal
+      controller counterparty
+      do
+        -- Fetch both proposals into the transaction context.
+        proposerProposal <- fetch proposerProposalCid
+        counterpartyProposal <- fetch counterpartyProposalCid
+
+        -- Assert that the parties involved are the expected ones.
+        proposerProposal.owner === proposer
+        counterpartyProposal.owner === counterparty
+
+        -- Assert that the economic terms of the proposals are compatible.
+        proposerProposal.instrumentId === counterpartyProposal.instrumentId
+        proposerProposal.quantity === counterpartyProposal.quantity
+        proposerProposal.price === counterpartyProposal.price
+        assertMsg "Proposals must be for opposite sides of the trade"
+          (proposerProposal.isBuy /= counterpartyProposal.isBuy)
+
+        -- Determine buyer and seller based on the `isBuy` flag.
+        let (buyer, seller) =
+              if proposerProposal.isBuy then
+                (proposer, counterparty)
+              else
+                (counterparty, proposer)
+
+        -- Atomically archive the proposals, consuming them from the ACS.
+        archive proposerProposalCid
+        archive counterpartyProposalCid
+
+        -- Create the bilateral MatchedTrade contract.
+        now <- getTime
+        create MatchedTrade with
+          tradeId = invitationId
+          buyer
+          seller
+          instrumentId = proposerProposal.instrumentId
+          quantity = proposerProposal.quantity
+          price = proposerProposal.price
+          settlementAmount = proposerProposal.quantity * proposerProposal.price
+          tradeDate = toDateUTC now
+
+    choice Decline : ()
+      controller counterparty
+      do
+        -- Allows the counterparty to cleanly remove the invitation without
+        -- attempting a match.
+        pure ()
+
+-- | Daml Script tests to validate the matching logic.
+setupMatchingTest = script do
+  seller <- allocateParty "Seller"
+  buyer <- allocateParty "Buyer"
+
+  let
+    instrument = "ISIN-US0378331005" -- AAPL
+    qty = 1000.0
+    px = 175.50
+
+  -- Seller creates a proposal to sell.
+  sellProposalCid <- submit seller do
+    create Proposal with
+      owner = seller
+      instrumentId = instrument
+      quantity = qty
+      price = px
+      isBuy = False
+
+  -- Buyer creates a proposal to buy.
+  buyProposalCid <- submit buyer do
+    create Proposal with
+      owner = buyer
+      instrumentId = instrument
+      quantity = qty
+      price = px
+      isBuy = True
+
+  pure (seller, buyer, sellProposalCid, buyProposalCid)
+
+-- | Test a successful match.
+testSuccessfulMatch : Script ()
+testSuccessfulMatch = script do
+  (seller, buyer, sellProposalCid, buyProposalCid) <- setupMatchingTest
+
+  -- Seller invites Buyer to match proposals.
+  let invId = "TRADE-001"
+  invitationCid <- submit seller do
+    create MatchInvitation with
+      invitationId = invId
+      proposer = seller
+      counterparty = buyer
+      proposerProposalCid = sellProposalCid
+
+  -- Buyer accepts the invitation, providing their compatible proposal.
+  matchedTradeCid <- submit buyer do
+    exercise invitationCid AcceptMatch with counterpartyProposalCid = buyProposalCid
+
+  -- Verify the outcome.
+  Some matchedTrade <- queryContractId buyer matchedTradeCid
+  matchedTrade.buyer === buyer
+  matchedTrade.seller === seller
+  matchedTrade.quantity === 1000.0
+  matchedTrade.price === 175.50
+
+  -- Verify proposals have been archived.
+  None <- queryContractId buyer buyProposalCid
+  None <- queryContractId seller sellProposalCid
+
+  pure ()
+
+
+-- | Test a failed match due to a price mismatch.
+testFailedMatch : Script ()
+testFailedMatch = script do
+  (seller, buyer, _, _) <- setupMatchingTest
+
+  -- Create proposals with mismatched prices.
+  sellProposalCid <- submit seller do
+    create Proposal with owner = seller, instrumentId = "ISIN-US0378331005", quantity = 1000.0, price = 175.50, isBuy = False
+  buyProposalCid <- submit buyer do
+    create Proposal with owner = buyer, instrumentId = "ISIN-US0378331005", quantity = 1000.0, price = 175.45, isBuy = True
+
+  -- Seller invites Buyer.
+  let invId = "TRADE-002"
+  invitationCid <- submit seller do
+    create MatchInvitation with
+      invitationId = invId
+      proposer = seller
+      counterparty = buyer
+      proposerProposalCid = sellProposalCid
+
+  -- Buyer attempts to accept, which should fail.
+  submitMustFail buyer do
+    exercise invitationCid AcceptMatch with counterpartyProposalCid = buyProposalCid
+
+  -- Verify that the original proposals still exist.
+  Some _ <- queryContractId buyer buyProposalCid
+  Some _ <- queryContractId seller sellProposalCid
+
+  pure ()
