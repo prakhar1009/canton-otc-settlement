@@ -1,0 +1,242 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module OTCTest where
+
+import Daml.Script
+import DA.Assert
+import DA.Date as D
+import DA.Time
+import DA.Next.Set (singleton)
+
+import OTC.Proposal
+import OTC.MatchingEngine
+import OTC.DvPSettlement
+import OTC.CounterpartyRegistry
+import OTC.TradeConfirmation
+
+-- | Dummy fungible instrument template for testing purposes.
+template DummyInstrument
+  with
+    issuer: Party
+    owner: Party
+    symbol: Text
+    quantity: Decimal
+  where
+    signatory issuer, owner
+
+    choice Transfer : ContractId DummyInstrument
+      with
+        newOwner: Party
+      controller owner
+      do
+        create this with owner = newOwner
+
+-- | Dummy cash template for testing purposes.
+template DummyCash
+  with
+    issuer: Party
+    owner: Party
+    currency: Text
+    amount: Decimal
+  where
+    signatory issuer, owner
+
+    choice Transfer : ContractId DummyCash
+      with
+        newOwner: Party
+      controller owner
+      do
+        create this with owner = newOwner
+
+-- | Test suite for the entire OTC workflow.
+otcTests : Script ()
+otcTests = script do
+  -- Parties
+  operator <- allocatePartyWithHint "Operator" (PartyIdHint "operator")
+  traderA <- allocatePartyWithHint "TraderA" (PartyIdHint "traderA")
+  traderB <- allocatePartyWithHint "TraderB" (PartyIdHint "traderB")
+  issuer <- allocatePartyWithHint "Issuer" (PartyIdHint "issuer")
+
+  -- Setup common contracts for tests
+  -- 1. Register counterparties
+  let relationship = CounterpartyRelationship with operator; partyA = traderA; partyB = traderB; observers = singleton operator
+  relationshipCid <- submit operator do createCmd relationship
+
+  -- 2. Create matching engine
+  engineCid <- submit operator do createCmd Engine with operator; observers = singleton operator
+
+  -- 3. Create initial assets
+  let
+    tradeDate = D.date 2024 D.Jan 10
+    settlementDate = D.addDays tradeDate 2
+    tradeId = "T12345"
+    instrumentSymbol = "ACME"
+    instrumentQuantity = 1000.0
+    cashCurrency = "USD"
+    cashAmount = 150000.0
+
+  instrumentForA_Cid <- submit issuer do createCmd DummyInstrument with issuer; owner = traderA; symbol = instrumentSymbol; quantity = instrumentQuantity
+  cashForB_Cid <- submit issuer do createCmd DummyCash with issuer; owner = traderB; currency = cashCurrency; amount = cashAmount
+
+  -- Test Case 1: Successful match and DvP settlement
+  test "Successful match and DvP settlement" do
+    -- 4. Trader A submits a proposal to SELL the instrument
+    let proposalA = Proposal with
+          proposer = traderA
+          counterparty = traderB
+          operator
+          tradeId
+          tradeDate
+          settlementDate
+          direction = SELL
+          instrumentSymbol
+          instrumentQuantity
+          cashCurrency
+          cashAmount
+          observers = singleton operator
+    proposalA_Cid <- submit traderA do createCmd proposalA
+
+    -- 5. Trader B submits a matching proposal to BUY the instrument
+    let proposalB = Proposal with
+          proposer = traderB
+          counterparty = traderA
+          operator
+          tradeId
+          tradeDate
+          settlementDate
+          direction = BUY
+          instrumentSymbol
+          instrumentQuantity
+          cashCurrency
+          cashAmount
+          observers = singleton operator
+    proposalB_Cid <- submit traderB do createCmd proposalB
+
+    -- 6. Operator matches the two sealed proposals
+    dvpCid <- submit operator do exerciseCmd engineCid MatchProposals with
+      proposalA_Cid
+      proposalB_Cid
+      relationshipCid
+
+    -- 7. Assert DvP contract exists and proposals are gone
+    Some dvpContract <- queryContractId @DvPSettlement operator dvpCid
+    dvpContract.seller === traderA
+    dvpContract.buyer === traderB
+    dvpContract.tradeId === tradeId
+
+    queryContractId @Proposal traderA proposalA_Cid === None
+    queryContractId @Proposal traderB proposalB_Cid === None
+
+    -- 8. Operator triggers the atomic settlement
+    confirmationCid <- submit operator do exerciseCmd dvpCid Settle with
+      instrumentToDeliverCid = instrumentForA_Cid
+      paymentToDeliverCid = cashForB_Cid
+
+    -- 9. Assert final state
+    -- DvP contract should be consumed
+    queryContractId @DvPSettlement operator dvpCid === None
+
+    -- TradeConfirmation should exist
+    Some confirmation <- queryContractId @TradeConfirmation operator confirmationCid
+    confirmation.seller === traderA
+    confirmation.buyer === traderB
+    confirmation.tradeId === tradeId
+    confirmation.instrumentQuantity === instrumentQuantity
+    confirmation.cashAmount === cashAmount
+
+    -- Asset ownership should have flipped
+    [(aCid, a)] <- query @DummyInstrument issuer
+    a.owner === traderB
+
+    [(cCid, c)] <- query @DummyCash issuer
+    c.owner === traderA
+
+    pure ()
+
+  -- Test Case 2: Mismatched proposals fail to match
+  test "Mismatched proposals fail to match" do
+    -- Reset assets for test isolation
+    instrumentForA2_Cid <- submit issuer do createCmd DummyInstrument with issuer; owner = traderA; symbol = instrumentSymbol; quantity = instrumentQuantity
+    cashForB2_Cid <- submit issuer do createCmd DummyCash with issuer; owner = traderB; currency = cashCurrency; amount = cashAmount
+
+    let mismatchedAmount = cashAmount + 1.0
+
+    -- Trader A submits a proposal
+    let proposalA2 = Proposal with
+          proposer = traderA
+          counterparty = traderB
+          operator
+          tradeId = "T-MISMATCH"
+          tradeDate
+          settlementDate
+          direction = SELL
+          instrumentSymbol
+          instrumentQuantity
+          cashCurrency
+          cashAmount
+          observers = singleton operator
+    proposalA2_Cid <- submit traderA do createCmd proposalA2
+
+    -- Trader B submits a proposal with a different price
+    let proposalB2 = Proposal with
+          proposer = traderB
+          counterparty = traderA
+          operator
+          tradeId = "T-MISMATCH"
+          tradeDate
+          settlementDate
+          direction = BUY
+          instrumentSymbol
+          instrumentQuantity
+          cashCurrency
+          cashAmount = mismatchedAmount
+          observers = singleton operator
+    proposalB2_Cid <- submit traderB do createCmd proposalB2
+
+    -- Operator attempts to match them, which should fail
+    submitMustFail operator do exerciseCmd engineCid MatchProposals with
+      proposalA_Cid = proposalA2_Cid
+      proposalB_Cid = proposalB2_Cid
+      relationshipCid
+
+    -- Assert that both proposals are still active
+    Some _ <- queryContractId @Proposal traderA proposalA2_Cid
+    Some _ <- queryContractId @Proposal traderB proposalB2_Cid
+
+    -- Assert assets have not moved
+    Some a <- queryContractId @DummyInstrument issuer instrumentForA2_Cid
+    a.owner === traderA
+    Some c <- queryContractId @DummyCash issuer cashForB2_Cid
+    c.owner === traderB
+
+    pure ()
+
+  -- Test Case 3: Proposer rejects their own proposal before a match
+  test "Proposal rejection by originator" do
+    -- Trader B submits a proposal
+    let proposalB3 = Proposal with
+          proposer = traderB
+          counterparty = traderA
+          operator
+          tradeId = "T-REJECT"
+          tradeDate
+          settlementDate
+          direction = BUY
+          instrumentSymbol
+          instrumentQuantity
+          cashCurrency
+          cashAmount
+          observers = singleton operator
+    proposalB3_Cid <- submit traderB do createCmd proposalB3
+
+    -- Assert proposal exists
+    Some _ <- queryContractId @Proposal traderB proposalB3_Cid
+
+    -- Trader B rejects their own proposal
+    submit traderB do exerciseCmd proposalB3_Cid Reject
+
+    -- Assert proposal is now archived
+    queryContractId @Proposal traderB proposalB3_Cid === None
+
+    pure ()
