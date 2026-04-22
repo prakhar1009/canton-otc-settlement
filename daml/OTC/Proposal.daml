@@ -1,81 +1,152 @@
--- | This module contains the template for a sealed, unilateral trade proposal.
--- The proposal is only visible to the proposer, ensuring zero pre-trade
--- information leakage, a core requirement for institutional OTC markets.
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
 module OTC.Proposal where
 
-import DA.Date (Date)
+import DA.Time (Time, addRelTime, days, hours, minutes)
+import DA.Date as D (Date)
+import Daml.Script
+import OTC.TradeConfirmation (TradeConfirmation)
 
--- | A simplified representation of a tradable asset. In a production system,
--- this would likely be replaced with a standard instrument key, such as
--- Daml.Finance.Instrument.Base.Type.InstrumentKey or a custom implementation
--- following CIP-0056.
-data Asset = Asset
+-- | Defines the side of a trade, either Buy or Sell.
+data BuySell = Buy | Sell
+  deriving (Eq, Show)
+
+-- | Contains all the economic details of a proposed trade.
+-- This is separated into a data type to make matching logic cleaner.
+data ProposalDetails = ProposalDetails
   with
-    issuer : Party
-    symbol : Text
-  deriving (Eq, Show, Ord)
+    tradeId : Text
+    -- ^ A unique identifier for the trade, agreed upon out-of-band.
+    instrument : Text
+    -- ^ The identifier for the instrument being traded (e.g., ISIN, CUSIP).
+    buySell : BuySell
+    -- ^ The side of the trade for the proposer.
+    quantity : Decimal
+    -- ^ The quantity of the instrument to be traded.
+    price : Decimal
+    -- ^ The price per unit of the instrument.
+    settlementDate : Date
+    -- ^ The target date for settlement.
+    settlementAsset: Text
+    -- ^ The identifier for the asset used for settlement (e.g., "USD", "EUR").
+  deriving (Eq, Show)
 
--- | Represents one side of a potential bilateral trade.
--- It is a sealed proposal, visible only to the `proposer`. The `counterparty`
--- field indicates the intended trading partner, but that party has no visibility
--- of this contract until a match is attempted. The `tradeId` is a
--- non-ledger-enforced identifier used by the trading parties to correlate
--- their respective proposals off-ledger.
+-- | Represents a sealed, one-sided proposal for an OTC trade.
+-- It is only visible to the proposer and their intended counterparty.
+-- Canton's privacy model ensures that neither party can see the other's proposal
+-- until both have been committed to the ledger, preventing information leakage.
 template Proposal
   with
-    proposer       : Party
-      -- ^ The party making the proposal.
-    counterparty   : Party
-      -- ^ The intended counterparty for the trade.
-    tradeId        : Text
-      -- ^ A unique identifier for the trade, agreed upon off-ledger.
-    baseAsset      : Asset
-      -- ^ The asset being offered for sale (e.g., 100 shares of ACME).
-    baseAmount     : Decimal
-      -- ^ The quantity of the base asset.
-    quoteAsset     : Asset
-      -- ^ The asset desired in return (e.g., USD).
-    quoteAmount    : Decimal
-      -- ^ The quantity of the quote asset.
-    settlementDate : Date
-      -- ^ The agreed-upon date for settlement.
+    proposer : Party
+    -- ^ The party making the proposal.
+    counterparty : Party
+    -- ^ The party to whom the proposal is directed.
+    details : ProposalDetails
+    -- ^ The economic terms of the proposal.
+    expiryTime : Time
+    -- ^ The time after which this proposal is no longer valid for matching.
   where
     signatory proposer
+    observer counterparty
 
-    -- The key privacy feature: only the proposer can see this contract.
-    -- The counterparty gains no knowledge of this proposal until the proposer
-    -- decides to reveal it in a matching attempt.
-    observer proposer
-
-    key (proposer, counterparty, tradeId) : (Party, Party, Text)
+    key (proposer, details.tradeId) : (Party, Text)
     maintainer key._1
 
-    ensure
-      baseAmount > 0.0 && quoteAmount > 0.0
+    -- | Allows the counterparty to accept the proposal by providing their own
+    -- matching mirror-image proposal. This choice atomically matches the two
+    -- proposals and creates a `TradeConfirmation` contract.
+    choice Match : ContractId TradeConfirmation
+      with
+        counterpartyProposalCid : ContractId Proposal
+        -- ^ The contract ID of the counterparty's matching proposal.
+      controller counterparty
+      do
+        now <- getTime
+        assertMsg ("This proposal has expired. Expiry time: " <> show expiryTime <> ", Current time: " <> show now) (now <= expiryTime)
 
-    -- | Allows the proposer to cancel their proposal at any time before it is
-    -- matched and consumed. This is a simple archival action.
-    choice Cancel : ()
+        counterpartyProposal <- fetch counterpartyProposalCid
+        let cpDetails = counterpartyProposal.details
+
+        -- Validate that the counterparty proposal is the exact mirror of this one.
+        assertMsg "Counterparty in matching proposal must be the proposer of this proposal"
+          (counterpartyProposal.counterparty == proposer)
+        assertMsg "Proposer of matching proposal must be the counterparty of this proposal"
+          (counterpartyProposal.proposer == counterparty)
+        assertMsg "Trade IDs must match" (details.tradeId == cpDetails.tradeId)
+        assertMsg "Instruments must match" (details.instrument == cpDetails.instrument)
+        assertMsg "Quantities must match" (details.quantity == cpDetails.quantity)
+        assertMsg "Prices must match" (details.price == cpDetails.price)
+        assertMsg "Settlement dates must match" (details.settlementDate == cpDetails.settlementDate)
+        assertMsg "Settlement assets must match" (details.settlementAsset == cpDetails.settlementAsset)
+        assertMsg "Sides must be opposite (Buy vs Sell)" (details.buySell /= cpDetails.buySell)
+        assertMsg ("Counterparty's proposal has expired. Expiry time: " <> show counterpartyProposal.expiryTime <> ", Current time: " <> show now)
+          (now <= counterpartyProposal.expiryTime)
+
+        -- Both proposals are valid and match. Archive them to prevent re-use.
+        archive self
+        archive counterpartyProposalCid
+
+        -- Determine buyer and seller based on the `buySell` flag.
+        let (buyer, seller) =
+              if details.buySell == Buy
+              then (proposer, counterparty)
+              else (counterparty, proposer)
+
+        -- Create a legally binding trade confirmation, visible to both parties.
+        create TradeConfirmation with
+          buyer
+          seller
+          tradeId = details.tradeId
+          instrument = details.instrument
+          quantity = details.quantity
+          price = details.price
+          settlementDate = details.settlementDate
+          settlementAmount = details.quantity * details.price
+          settlementAsset = details.settlementAsset
+
+    -- | Allows the proposer to cancel their own proposal after it has expired,
+    -- cleaning it from the active contract set.
+    choice Expire : ()
       controller proposer
       do
-        pure ()
+        now <- getTime
+        assertMsg ("Proposal has not yet expired. Expiry time: " <> show expiryTime <> ", Current time: " <> show now) (now > expiryTime)
 
-    -- | A non-consuming choice to allow the proposer to view the terms of their
-    -- own proposal without fetching the entire contract. Useful for UI display.
-    nonconsuming choice GetView : ProposalView
-      controller proposer
-      do
-        return ProposalView with ..
+        -- The choice body is empty as its only purpose is to archive the contract.
+        -- The archival happens automatically upon successful completion of a consuming choice.
+        return ()
 
--- | A view type for the Proposal template, for use in UI and queries.
-data ProposalView = ProposalView
-  with
-    proposer       : Party
-    counterparty   : Party
-    tradeId        : Text
-    baseAsset      : Asset
-    baseAmount     : Decimal
-    quoteAsset     : Asset
-    quoteAmount    : Decimal
-    settlementDate : Date
-  deriving (Eq, Show)
+-- | Helper function for Daml Script testing to create proposals.
+setupProposals : Script (ContractId Proposal, ContractId Proposal)
+setupProposals = script do
+  alice <- allocatePartyWithHint "Alice" (PartyIdHint "Alice")
+  bob <- allocatePartyWithHint "Bob" (PartyIdHint "Bob")
+
+  now <- getTime
+  let
+    expiry = addRelTime now (hours 24)
+    settleDate = D.addDays (D.date (D.year now) (D.month now) (D.day now)) 2
+
+    sharedDetails = ProposalDetails
+      with
+        tradeId = "TRADE-2024-001"
+        instrument = "ISIN-US0378331005" -- Apple Inc.
+        quantity = 1000.0
+        price = 170.50
+        settlementDate = settleDate
+        settlementAsset = "USD"
+
+  aliceCid <- alice `submit` createCmd Proposal with
+    proposer = alice
+    counterparty = bob
+    details = sharedDetails with buySell = Buy
+    expiryTime = expiry
+
+  bobCid <- bob `submit` createCmd Proposal with
+    proposer = bob
+    counterparty = alice
+    details = sharedDetails with buySell = Sell
+    expiryTime = expiry
+
+  return (aliceCid, bobCid)
